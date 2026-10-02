@@ -143,11 +143,10 @@
 6. `GAME_OVER` (Server -> Clients): Victory / Draw notification with final scores.
 ```json
 {
-  "msg_type" : "GAME_OVER"
-  "player_id" : "Player"
+  "msg_type" : "GAME_OVER",
+  "player_id" : "Player",
   "payload" : {
     "winner" : "Player_1",
-    
   },
   "timestamp" : 00000000000
 }
@@ -156,8 +155,8 @@
 7. `ERROR` (Server -> Client): Invalid move or malformed packet error.
 ```json
 {
-  "msg_type" : "ERROR"
-  "player_id" : "Player"
+  "msg_type" : "ERROR",
+  "player_id" : "Player",
   "payload" : {
     "error_code" : 400,
     "error_message" : "Invalid move: Cell already guessed."
@@ -169,8 +168,8 @@
 8. `DISCONNECT` (Client -> Server): Player voluntarily leaves the game.
 ```json
 {
-  "msg_type" : "DISCONNECT"
-  "player_id" : "Player"
+  "msg_type" : "DISCONNECT",
+  "player_id" : "Player",
   "timestamp" : 00000000000
 }
 ```
@@ -201,9 +200,12 @@ stateDiagram
     WAITING_FOR_PLAYERS --> GAME_START : Players Connect
     GAME_START --> PLAYER_TURN : Initialize Game Boards<br>Players place ships
     PLAYER_TURN --> EVALUATE_MOVE : Player makes a move
-    EVALUATE_MOVE --> PLAYER_TURN : Valid Move<br>Hit or Miss<br>Next Player's Turn
+    EVALUATE_MOVE --> PLAYER_TURN : Valid Move<br>Hit or Miss<br>Board Updated<br>Next Player's Turn
     EVALUATE_MOVE --> PLAYER_TURN : Invalid Move<br>Send Error<br>Same Player's Turn
     EVALUATE_MOVE --> GAME_OVER : Player with no ships remaining loses
+    PLAYER_TURN --> CONNECTION_INTERUPTION : Player disconnects
+    CONNECTION_INTERUPTION --> GAME_OVER : Disconnect message received<br>Reconnect timer expired<br>Disconnected Player Forfeits
+    CONNECTION_INTERUPTION --> PLAYER_TURN : Player reconnects<br>Resume game
     GAME_OVER --> CLEANUP : Broadcast Winner
     CLEANUP --> WAITING_FOR_PLAYERS: Reset for next game
 ```
