@@ -8,13 +8,28 @@ Battleship game played over TCP with newline-delimited JSON payloads.
 
 Architecture & Concurrency:
 - Finite State Machine (FSM): INIT -> WAITING_FOR_PLAYERS -> GAME_START ->
-  PLAYER_TURN / WAITING_FOR_TURN -> EVALUATE_MOVE -> GAME_OVER -> CLEANUP.
+  SHIP_PLACEMENT -> PLAYER_TURN / WAITING_FOR_TURN -> EVALUATE_MOVE -> GAME_OVER -> CLEANUP.
 - Concurrency: Background listener thread receives and frames streaming JSON
-  messages from the server, while the main thread manages user input and turn execution.
+  messages from the server, while the main thread manages user placement input,
+  turn coordination, and attack coordinates.
+
+Fleet Specification:
+- A: Aircraft Carrier (5 slots)
+- B: Battleship (4 slots)
+- C: Cruiser (3 slots)
+- S: Submarine (3 slots)
+- D: Destroyer (2 slots)
+
+UI & Visuals:
+- Players can select Manual or Random fleet deployment.
+- Board coloring: Hits ('X') in Red, Misses ('M') in Blue, Ships ('A','B','C','S','D') in Green.
+- Move results are rendered directly below the last board update for clarity.
 """
 
 import argparse
 import json
+import os
+import random
 import re
 import signal
 import socket
@@ -22,7 +37,23 @@ import sys
 import threading
 import time
 from enum import Enum
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
+
+# Enable ANSI escape code processing on Windows terminals
+if sys.platform == "win32":
+    try:
+        os.system("")
+    except Exception:
+        pass
+
+# ANSI Color & Style Codes
+COLOR_RED = "\033[91m"
+COLOR_GREEN = "\033[92m"
+COLOR_YELLOW = "\033[93m"
+COLOR_BLUE = "\033[94m"
+COLOR_CYAN = "\033[96m"
+COLOR_BOLD = "\033[1m"
+COLOR_RESET = "\033[0m"
 
 
 class ClientState(str, Enum):
@@ -30,6 +61,7 @@ class ClientState(str, Enum):
     INIT = "INIT"
     WAITING_FOR_PLAYERS = "WAITING_FOR_PLAYERS"
     GAME_START = "GAME_START"
+    SHIP_PLACEMENT = "SHIP_PLACEMENT"
     PLAYER_TURN = "PLAYER_TURN"
     WAITING_FOR_TURN = "WAITING_FOR_TURN"
     EVALUATE_MOVE = "EVALUATE_MOVE"
@@ -37,6 +69,16 @@ class ClientState(str, Enum):
     CONNECTION_INTERRUPTED = "CONNECTION_INTERRUPTED"
     CLEANUP = "CLEANUP"
     DISCONNECTED = "DISCONNECTED"
+
+
+# Fleet Specification: 5 Ships with specific designation letters and slot sizes
+FLEET_SPEC = [
+    {"name": "Aircraft Carrier", "letter": "A", "size": 5},
+    {"name": "Battleship", "letter": "B", "size": 4},
+    {"name": "Cruiser", "letter": "C", "size": 3},
+    {"name": "Submarine", "letter": "S", "size": 3},
+    {"name": "Destroyer", "letter": "D", "size": 2}
+]
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -131,10 +173,11 @@ class MessageFramer:
         return messages
 
 
-def format_grid(grid: list) -> str:
+def format_grid(grid: list, colorize: bool = True) -> str:
     """
     Formats a 10x10 matrix into the project's standard ASCII Battleship board grid.
     Columns: A-J, Rows: 01-10.
+    Applies colors when colorize is True (Hits 'X' in Red, Misses 'M' in Blue, Ships in Green).
     """
     cols = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J"]
     lines = []
@@ -148,19 +191,62 @@ def format_grid(grid: list) -> str:
         for c in range(10):
             val = grid[r][c] if r < len(grid) and c < len(grid[r]) else " "
             val_str = str(val).strip() if val is not None else " "
-            row_cells.append(val_str if val_str else " ")
+            if not val_str:
+                cell_display = " "
+            elif colorize:
+                if val_str == "X":
+                    cell_display = f"{COLOR_RED}{COLOR_BOLD}X{COLOR_RESET}"
+                elif val_str == "M":
+                    cell_display = f"{COLOR_BLUE}M{COLOR_RESET}"
+                elif val_str in ("A", "B", "C", "S", "D"):
+                    cell_display = f"{COLOR_GREEN}{val_str}{COLOR_RESET}"
+                else:
+                    cell_display = val_str
+            else:
+                cell_display = val_str
+            row_cells.append(cell_display)
         lines.append(f"|{row_label}|" + "|".join(row_cells) + "|")
         lines.append(divider)
     return "\n".join(lines)
 
 
+def colorize_board_str(board_text: str) -> str:
+    """
+    Colorizes an ASCII board string received from the server.
+    Preserves column headers while coloring:
+      - 'X' (Hits) in Bright Bold Red
+      - 'M' (Misses) in Bright Blue
+      - 'A','B','C','S','D' (Ships) in Green
+    """
+    if not board_text:
+        return ""
+    lines = board_text.strip().split("\n")
+    colored_lines = []
+    for line in lines:
+        if line.startswith("|00|"):
+            colored_lines.append(line)
+        elif line.startswith("|") and len(line) > 3 and line[1:3].isdigit():
+            def repl(m):
+                c = m.group(1)
+                if c == "X":
+                    return f"|{COLOR_RED}{COLOR_BOLD}X{COLOR_RESET}"
+                elif c == "M":
+                    return f"|{COLOR_BLUE}M{COLOR_RESET}"
+                elif c in ("A", "B", "C", "S", "D"):
+                    return f"|{COLOR_GREEN}{c}{COLOR_RESET}"
+                return f"|{c}"
+            colored_line = re.sub(r"\|([XAMBCSD])(?=\|)", repl, line)
+            colored_lines.append(colored_line)
+        else:
+            colored_lines.append(line)
+    return "\n".join(colored_lines)
+
+
 def parse_coordinate(coord_input: str) -> Optional[Tuple[str, int, int, int]]:
     """
-    Parses a user input coordinate string (e.g., 'A1', 'B10', 'j5') into:
+    Parses a target strike coordinate string (e.g. 'A1', 'B10', 'j5') into:
     (col_letter, row_num, col_idx, row_idx).
-    Valid columns: A-J (case-insensitive)
-    Valid rows: 1-10
-    Returns None if the format is invalid.
+    Valid columns: A-J (case-insensitive), Valid rows: 1-10.
     """
     cleaned = coord_input.strip().upper()
     match = re.match(r"^([A-J])\s*([0-9]|10)$", cleaned)
@@ -175,11 +261,35 @@ def parse_coordinate(coord_input: str) -> Optional[Tuple[str, int, int, int]]:
     return col_letter, row_num, col_idx, row_idx
 
 
+def parse_placement_input(user_str: str) -> Optional[Tuple[str, int, str]]:
+    """
+    Parses a ship placement string like 'A1 H', 'b3 v', 'C5 horizontal', 'D4, V', 'A1'.
+    Returns (col_letter, row_num, orientation), where:
+      col_letter is 'A'-'J',
+      row_num is 1-10,
+      orientation is 'H' or 'V' (or '' if not specified in input).
+    Returns None if format is invalid.
+    """
+    cleaned = user_str.strip()
+    match = re.match(r"^([A-Ja-j])\s*([0-9]|10)\s*[,;\-\s]?\s*([HhVv](?:orizontal|ertical)?|[HhVv])?$", cleaned)
+    if not match:
+        return None
+    col = match.group(1).upper()
+    row = int(match.group(2))
+    if row < 1 or row > 10:
+        return None
+    orient_raw = match.group(3)
+    orientation = ""
+    if orient_raw:
+        orientation = "H" if orient_raw[0].upper() == "H" else "V"
+    return col, row, orientation
+
+
 class BattleshipClient:
     """
     Client for the network Battleship game.
-    Manages TCP communication, FSM state transitions, message framing,
-    and user interactions.
+    Manages TCP communication, FSM state transitions, fleet placement options,
+    board colorization, and attack turn interactions.
     """
     def __init__(self, hostname: str, port: int, player_id: str = "Player"):
         self.hostname = hostname
@@ -192,6 +302,9 @@ class BattleshipClient:
         self._listener_thread: Optional[threading.Thread] = None
         self._send_lock = threading.Lock()
         self._framer = MessageFramer()
+
+        # Thread synchronization events
+        self.placement_event = threading.Event()
         self.my_turn_event = threading.Event()
 
     def connect(self) -> bool:
@@ -236,9 +349,7 @@ class BattleshipClient:
         return True
 
     def send_message(self, msg_type: str, payload: Optional[dict] = None) -> bool:
-        """
-        Encodes and transmits a newline-delimited JSON message to the server.
-        """
+        """Encodes and transmits a newline-delimited JSON message to the server."""
         if not self.sock:
             return False
 
@@ -261,10 +372,7 @@ class BattleshipClient:
             return False
 
     def _listen_loop(self):
-        """
-        Background worker thread that reads from TCP socket and processes incoming
-        JSON messages.
-        """
+        """Background worker thread that reads from TCP socket and processes incoming JSON messages."""
         while self.running:
             try:
                 data = self.sock.recv(4096)
@@ -287,12 +395,11 @@ class BattleshipClient:
 
         self.state = ClientState.DISCONNECTED
         self.running = False
-        self.my_turn_event.set()  # Unblock main thread if waiting
+        self.placement_event.set()
+        self.my_turn_event.set()
 
     def _handle_message(self, msg: dict):
-        """
-        Finite State Machine transition logic based on protocol message types.
-        """
+        """Finite State Machine transition logic based on protocol message types."""
         msg_type = msg.get("msg_type")
         payload = msg.get("payload", {})
         if not isinstance(payload, dict):
@@ -300,10 +407,11 @@ class BattleshipClient:
 
         if msg_type == "LOBBY_WAIT":
             self.state = ClientState.WAITING_FOR_PLAYERS
-            print("\n[Lobby] Waiting for opponent to join the match...")
+            msg_desc = payload.get("message", "Waiting for opponent to join the match...")
+            print(f"\n[Lobby] {msg_desc}")
 
         elif msg_type == "GAME_START":
-            self.state = ClientState.GAME_START
+            self.state = ClientState.SHIP_PLACEMENT
             print("\n" + "=" * 55)
             print("         BATTLESHIP - GAME COMMENCED!            ")
             print("=" * 55)
@@ -313,20 +421,8 @@ class BattleshipClient:
             elif "player_id" in msg and msg["player_id"]:
                 self.player_id = msg["player_id"]
 
-            active_turn = (
-                payload.get("turn") or 
-                payload.get("first_turn") or 
-                payload.get("active_player") or
-                payload.get("next_turn")
-            )
-            if active_turn == self.player_id:
-                print("Coin flip result: You have the first turn!")
-                self.state = ClientState.PLAYER_TURN
-                self.my_turn_event.set()
-            elif active_turn:
-                print(f"Coin flip result: {active_turn} has the first turn.")
-                self.state = ClientState.WAITING_FOR_TURN
-                self.my_turn_event.clear()
+            print("[*] Match initiated! Proceeding to fleet deployment phase...")
+            self.placement_event.set()
 
         elif msg_type == "STATE_UPDATE":
             move_res = (
@@ -334,28 +430,38 @@ class BattleshipClient:
                 payload.get("move_result") or 
                 payload.get("result")
             )
-            if move_res:
-                print(f"\n================ [ MOVE RESULT: {move_res.upper()} ] ================")
 
-            # Print game boards if included in state update
             offense = payload.get("offense board") or payload.get("offense_board")
             defense = payload.get("defense board") or payload.get("defense_board")
 
+            # 1. Display Offense Board
             if offense:
                 print("\n[OFFENSE BOARD] (Your strikes on enemy territory):")
                 if isinstance(offense, str):
-                    print(offense.strip())
+                    print(colorize_board_str(offense))
                 elif isinstance(offense, list):
-                    print(format_grid(offense))
+                    print(format_grid(offense, colorize=True))
 
+            # 2. Display Defense Board (the last board update)
             if defense:
                 print("\n[DEFENSE BOARD] (Your fleet):")
                 if isinstance(defense, str):
-                    print(defense.strip())
+                    print(colorize_board_str(defense))
                 elif isinstance(defense, list):
-                    print(format_grid(defense))
+                    print(format_grid(defense, colorize=True))
 
-            # Turn determination
+            # 3. Display Move Result BELOW the last board update for enhanced visibility
+            if move_res:
+                res_upper = move_res.upper()
+                if "HIT" in res_upper or "SUNK" in res_upper:
+                    colored_res = f"{COLOR_RED}{COLOR_BOLD}{res_upper}{COLOR_RESET}"
+                elif "MISS" in res_upper:
+                    colored_res = f"{COLOR_BLUE}{res_upper}{COLOR_RESET}"
+                else:
+                    colored_res = res_upper
+                print(f"\n================ [ MOVE RESULT: {colored_res} ] ================")
+
+            # 4. Determine turn
             next_turn = (
                 payload.get("next_turn") or 
                 payload.get("NextTurn") or 
@@ -364,63 +470,288 @@ class BattleshipClient:
                 payload.get("turn") or
                 payload.get("player_turn")
             )
-            is_my_turn = (next_turn == self.player_id) or (payload.get("is_your_turn") is True)
-
-            if is_my_turn:
-                print("\n>>> It is YOUR turn! Prepare your coordinates. <<<")
-                self.state = ClientState.PLAYER_TURN
-                self.my_turn_event.set()
-            else:
-                turn_label = next_turn if next_turn else "Opponent"
-                print(f"\n[Turn: {turn_label}] Awaiting opponent's strike...")
-                self.state = ClientState.WAITING_FOR_TURN
-                self.my_turn_event.clear()
+            if next_turn:
+                is_my_turn = (next_turn == self.player_id) or (payload.get("is_your_turn") is True)
+                if is_my_turn:
+                    print(f"\n>>> It is YOUR turn ({self.player_id})! Prepare your coordinates. <<<")
+                    self.state = ClientState.PLAYER_TURN
+                    self.my_turn_event.set()
+                else:
+                    turn_label = next_turn
+                    print(f"\n[Turn: {turn_label}] Awaiting opponent's strike...")
+                    self.state = ClientState.WAITING_FOR_TURN
+                    self.my_turn_event.clear()
 
         elif msg_type == "ERROR":
             err_code = payload.get("error_code", 400)
             err_msg = payload.get("error_message", "Invalid action.")
             print(f"\n[SERVER ERROR {err_code}]: {err_msg}")
-            # Per FSM: Invalid move keeps turn with same player
-            print("Please try entering a different coordinate.")
-            self.state = ClientState.PLAYER_TURN
-            self.my_turn_event.set()
+            if self.state == ClientState.EVALUATE_MOVE:
+                print("Please try entering a different coordinate.")
+                self.state = ClientState.PLAYER_TURN
+                self.my_turn_event.set()
 
         elif msg_type == "GAME_OVER":
             self.state = ClientState.GAME_OVER
             winner = payload.get("winner", "Unknown")
+            reason = payload.get("reason", "")
             print("\n" + "#" * 55)
             print("                    GAME OVER                    ")
             print("#" * 55)
             if winner == self.player_id:
-                print(f" VICTORY! All enemy ships destroyed. You ({self.player_id}) won!")
+                print(f" {COLOR_GREEN}{COLOR_BOLD}VICTORY! All enemy ships destroyed. You ({self.player_id}) won!{COLOR_RESET}")
             else:
-                print(f" DEFEAT! {winner} won the battle.")
+                print(f" {COLOR_RED}DEFEAT! {winner} won the battle.{COLOR_RESET}")
+            if reason:
+                print(f" Reason: {reason}")
             print("#" * 55 + "\n")
             self.running = False
-            self.my_turn_event.set()
+            self.disconnect()
+            print("[*] Game concluded. Exiting...")
+            sys.stdout.flush()
+            sys.stderr.flush()
+            time.sleep(0.1)
+            os._exit(0)
 
         elif msg_type == "DISCONNECT":
             print("\n[Notice] Received disconnect notification from server.")
             self.state = ClientState.DISCONNECTED
             self.running = False
-            self.my_turn_event.set()
+            self.disconnect()
+            sys.stdout.flush()
+            sys.stderr.flush()
+            time.sleep(0.1)
+            os._exit(0)
 
         elif msg_type == "RECONNECT_PROMPT":
             print("\n[Server Alert] Disconnection detected. Server prompted for reconnect.")
             self.state = ClientState.CONNECTION_INTERRUPTED
 
+    def _deploy_fleet(self) -> Optional[List[dict]]:
+        """
+        Offers the player the choice between manual and random ship placement.
+        - [M] Manual: Player positions each of the 5 ships in order.
+        - [R] Random: Fleet positions are automatically generated.
+        Returns the list of 5 placed ship dictionaries, or None if user quits.
+        """
+        print("\n" + "=" * 55)
+        print("               FLEET DEPLOYMENT OPTIONS                ")
+        print("=" * 55)
+        print("How would you like to position your fleet?")
+        print("  [M] Manual Placement  (Position each of the 5 ships in order)")
+        print("  [R] Random Placement  (Auto-generate valid fleet positions)")
+        print("=" * 55)
+
+        while True:
+            try:
+                choice = input("Enter deployment mode ([M]anual / [R]andom) or 'quit': ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                self.disconnect()
+                return None
+
+            if choice in ("quit", "exit", "q"):
+                self.disconnect()
+                return None
+            elif choice in ("r", "random", "auto"):
+                return self._place_ships_randomly()
+            elif choice in ("m", "manual", ""):
+                return self._place_ships_manually()
+            else:
+                print("Invalid selection. Please enter 'M' for manual or 'R' for random.")
+
+    def _place_ships_randomly(self) -> List[dict]:
+        """Automatically generates valid, non-overlapping positions for all 5 fleet ships."""
+        local_grid = [[" " for _ in range(10)] for _ in range(10)]
+        placed_ships = []
+
+        for spec in FLEET_SPEC:
+            name = spec["name"]
+            letter = spec["letter"]
+            size = spec["size"]
+            while True:
+                orient = random.choice(["H", "V"])
+                if orient == "H":
+                    r = random.randint(0, 9)
+                    c = random.randint(0, 10 - size)
+                    coords = [(r, c + i) for i in range(size)]
+                else:
+                    r = random.randint(0, 10 - size)
+                    c = random.randint(0, 9)
+                    coords = [(r + i, c) for i in range(size)]
+
+                # Collision check
+                if not any(local_grid[cr][cc] != " " for cr, cc in coords):
+                    for cr, cc in coords:
+                        local_grid[cr][cc] = letter
+                    coord_labels = [f"{chr(ord('A') + cc)}{cr + 1}" for cr, cc in coords]
+                    placed_ships.append({
+                        "name": name,
+                        "letter": letter,
+                        "size": size,
+                        "coords": [[cr, cc] for cr, cc in coords],
+                        "coord_labels": coord_labels
+                    })
+                    break
+
+        print("\n" + "=" * 55)
+        print("          RANDOM FLEET DEPLOYMENT GENERATED            ")
+        print("=" * 55)
+        for ship in placed_ships:
+            print(f"  {ship['letter']}: {ship['name']} ({ship['size']} slots) -> {', '.join(ship['coord_labels'])}")
+        print("\n--- Your Deployed Defense Board ---")
+        print(format_grid(local_grid, colorize=True))
+        print("=" * 55)
+        return placed_ships
+
+    def _place_ships_manually(self) -> Optional[List[dict]]:
+        """
+        Prompts the player to position each of the 5 fleet ships in order:
+          1. Aircraft Carrier (A) - 5 slots
+          2. Battleship (B) - 4 slots
+          3. Cruiser (C) - 3 slots
+          4. Submarine (S) - 3 slots
+          5. Destroyer (D) - 2 slots
+        Validates boundaries and prevents overlapping placements.
+        Returns the list of placed ship dictionaries, or None if user quits.
+        """
+        local_defense_grid = [[" " for _ in range(10)] for _ in range(10)]
+        placed_ships = []
+
+        print("\n" + "=" * 55)
+        print("               MANUAL FLEET DEPLOYMENT (5 SHIPS)         ")
+        print("=" * 55)
+        print("Ships to position in order:")
+        print("  1. Aircraft Carrier (A) - 5 slots")
+        print("  2. Battleship       (B) - 4 slots")
+        print("  3. Cruiser          (C) - 3 slots")
+        print("  4. Submarine        (S) - 3 slots")
+        print("  5. Destroyer        (D) - 2 slots")
+        print("\nEnter starting coordinate (e.g. A1) and orientation")
+        print("(H for horizontal, V for vertical). Example: 'A1 H' or 'B3 V'.")
+        print("=" * 55)
+
+        print("\n--- Initial Defense Board ---")
+        print(format_grid(local_defense_grid, colorize=True))
+
+        for idx, spec in enumerate(FLEET_SPEC):
+            name = spec["name"]
+            letter = spec["letter"]
+            size = spec["size"]
+
+            while True:
+                print(f"\n[Ship {idx + 1}/5] {name} ({letter}) - Length: {size} slots")
+                try:
+                    user_input = input(f"Enter placement for {name} (e.g. 'A1 H' or 'B3 V') or 'quit': ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    print()
+                    self.disconnect()
+                    return None
+
+                if not user_input:
+                    continue
+                if user_input.lower() in ("quit", "exit", "q"):
+                    self.disconnect()
+                    return None
+
+                parsed = parse_placement_input(user_input)
+                if not parsed:
+                    print("Error: Invalid input format. Use Column A-J and Row 1-10 (e.g. 'A1 H' or 'B3 V').")
+                    continue
+
+                col_letter, row_num, orient = parsed
+                if not orient:
+                    try:
+                        orient_input = input(f"  Enter orientation for {name} (H for horizontal, V for vertical): ").strip()
+                    except (EOFError, KeyboardInterrupt):
+                        print()
+                        self.disconnect()
+                        return None
+                    if orient_input.lower() in ("quit", "exit", "q"):
+                        self.disconnect()
+                        return None
+                    if not orient_input or orient_input[0].upper() not in ("H", "V"):
+                        print("Error: Invalid orientation. Must be 'H' (horizontal) or 'V' (vertical).")
+                        continue
+                    orient = orient_input[0].upper()
+
+                col_idx = ord(col_letter) - ord("A")
+                row_idx = row_num - 1
+
+                # 1. Bounds Validation
+                if orient == "H":
+                    if col_idx + size > 10:
+                        print(f"Error: {name} ({letter}) placed horizontally from {col_letter}{row_num} extends beyond Column J (board boundary).")
+                        print("Please re-enter coordinates.")
+                        continue
+                    coords = [(row_idx, col_idx + i) for i in range(size)]
+                else:
+                    if row_idx + size > 10:
+                        print(f"Error: {name} ({letter}) placed vertically from {col_letter}{row_num} extends beyond Row 10 (board boundary).")
+                        print("Please re-enter coordinates.")
+                        continue
+                    coords = [(row_idx + i, col_idx) for i in range(size)]
+
+                # 2. Overlap Validation
+                overlap_found = False
+                for r, c in coords:
+                    if local_defense_grid[r][c] != " ":
+                        existing_letter = local_defense_grid[r][c]
+                        existing_coord = f"{chr(ord('A') + c)}{r + 1}"
+                        print(f"Error: Placement overlaps with existing ship '{existing_letter}' at {existing_coord}!")
+                        print("Please re-enter coordinates.")
+                        overlap_found = True
+                        break
+
+                if overlap_found:
+                    continue
+
+                # 3. Valid Placement - update board and record ship
+                for r, c in coords:
+                    local_defense_grid[r][c] = letter
+
+                coord_labels = [f"{chr(ord('A') + c)}{r + 1}" for r, c in coords]
+                placed_ships.append({
+                    "name": name,
+                    "letter": letter,
+                    "size": size,
+                    "coords": [[r, c] for r, c in coords],
+                    "coord_labels": coord_labels
+                })
+
+                print(f"[+] Placed {name} ({letter}) at: {', '.join(coord_labels)}")
+                print("\n--- Current Defense Board ---")
+                print(format_grid(local_defense_grid, colorize=True))
+                break
+
+        print("\n" + "=" * 55)
+        print("          ALL 5 SHIPS DEPLOYED SUCCESSFULLY!             ")
+        print("=" * 55)
+        return placed_ships
+
     def run(self):
         """
-        Main execution loop. Manages user CLI input during active turns.
+        Main execution loop. Coordinates interactive ship placement phase
+        and player attack turns.
         """
         try:
             while self.running:
-                # Wait until it is this client's turn or game stops
-                self.my_turn_event.wait(timeout=0.5)
-                if not self.running:
-                    break
+                # 1. Ship Placement Phase
+                if self.state == ClientState.SHIP_PLACEMENT and self.placement_event.is_set():
+                    self.placement_event.clear()
+                    placed = self._deploy_fleet()
+                    if placed:
+                        self.state = ClientState.WAITING_FOR_TURN
+                        print("[+] Transmitting fleet coordinates to server...")
+                        if not self.send_message("PLACE_SHIPS", {"ships": placed}):
+                            print("[Error] Failed to send ship placement to server.")
+                            break
+                        print("[*] Waiting for opponent to position their fleet...")
+                    else:
+                        break
 
-                if self.state == ClientState.PLAYER_TURN and self.my_turn_event.is_set():
+                # 2. Player Turn Phase
+                elif self.state == ClientState.PLAYER_TURN and self.my_turn_event.is_set():
                     try:
                         user_input = input("Enter target coordinate (e.g. A5, J10) or 'quit': ").strip()
                     except (EOFError, KeyboardInterrupt):
@@ -442,7 +773,6 @@ class BattleshipClient:
                         continue
 
                     col_letter, row_num, col_idx, row_idx = coord
-                    # Construct MOVE payload supporting both protocol schemas
                     payload = {
                         "column": col_letter,
                         "row": row_num,
@@ -458,18 +788,20 @@ class BattleshipClient:
                         print("[Error] Failed to send move to server.")
                         break
 
+                else:
+                    time.sleep(0.1)
+
         except KeyboardInterrupt:
             print("\n[*] Interrupted by user.")
         finally:
             self.disconnect()
 
     def disconnect(self):
-        """
-        Performs graceful connection teardown and cleanup according to FSM.
-        """
+        """Performs graceful connection teardown and cleanup according to FSM."""
         if self.state != ClientState.DISCONNECTED and self.state != ClientState.CLEANUP:
             self.state = ClientState.CLEANUP
             self.running = False
+            self.placement_event.set()
             self.my_turn_event.set()
 
             if self.sock:

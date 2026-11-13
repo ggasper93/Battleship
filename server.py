@@ -13,12 +13,20 @@ Architecture & Concurrency (Option A: Multi-Threading):
   are synchronized using a threading.Lock to prevent race conditions during state mutation.
 - Network transmissions occur outside of lock acquisition to maintain responsiveness.
 - Framing: Newline-delimited ('\\n') JSON payloads conforming to protocol_blueprint.md.
+
+Fleet Specification:
+- A: Aircraft Carrier (5 slots)
+- B: Battleship (4 slots)
+- C: Cruiser (3 slots)
+- S: Submarine (3 slots)
+- D: Destroyer (2 slots)
 """
 
 import argparse
 import json
 import random
 import re
+import signal
 import socket
 import sys
 import threading
@@ -32,6 +40,7 @@ class ServerState(str, Enum):
     INIT = "INIT"
     WAITING_FOR_PLAYERS = "WAITING_FOR_PLAYERS"
     GAME_START = "GAME_START"
+    SHIP_PLACEMENT = "SHIP_PLACEMENT"
     PLAYER_TURN = "PLAYER_TURN"
     EVALUATE_MOVE = "EVALUATE_MOVE"
     GAME_OVER = "GAME_OVER"
@@ -39,13 +48,13 @@ class ServerState(str, Enum):
     CONNECTION_INTERRUPTED = "CONNECTION_INTERRUPTED"
 
 
-# Standard Battleship Fleet Configuration (5 Ships)
+# Fleet Specification: 5 Ships with specific designation letters and slot sizes
 FLEET_SPEC = [
-    {"name": "Carrier", "size": 5},
-    {"name": "Battleship", "size": 4},
-    {"name": "Cruiser", "size": 3},
-    {"name": "Submarine", "size": 3},
-    {"name": "Destroyer", "size": 2}
+    {"name": "Aircraft Carrier", "letter": "A", "size": 5},
+    {"name": "Battleship", "letter": "B", "size": 4},
+    {"name": "Cruiser", "letter": "C", "size": 3},
+    {"name": "Submarine", "letter": "S", "size": 3},
+    {"name": "Destroyer", "letter": "D", "size": 2}
 ]
 
 
@@ -70,72 +79,62 @@ class PlayerBoard:
     """
     Manages defense (fleet placement & damage) and offense (targeted cells)
     for a single player on 10x10 coordinate grids.
+    Ships are designated by letters:
+      A: Aircraft Carrier (5 slots)
+      B: Battleship (4 slots)
+      C: Cruiser (3 slots)
+      S: Submarine (3 slots)
+      D: Destroyer (2 slots)
     """
     def __init__(self, player_id: str):
         self.player_id = player_id
-        # defense_grid: 'S' = intact ship, 'X' = damaged ship, 'M' = enemy miss, ' ' = water
+        # defense_grid: 'A','B','C','S','D' = intact ships, 'X' = hit, 'M' = enemy miss, ' ' = water
         self.defense_grid: List[List[str]] = [[" " for _ in range(10)] for _ in range(10)]
         # offense_grid: 'X' = successful hit, 'M' = miss, ' ' = unexplored water
         self.offense_grid: List[List[str]] = [[" " for _ in range(10)] for _ in range(10)]
         self.ships: List[dict] = []
-        self._place_fleet_randomly()
 
-    def _place_fleet_randomly(self):
-        """Randomly generates valid, non-overlapping placements for all 5 fleet ships."""
-        for spec in FLEET_SPEC:
-            name = spec["name"]
-            size = spec["size"]
-            placed = False
-            attempts = 0
-            while not placed and attempts < 2000:
-                attempts += 1
-                orientation = random.choice(["H", "V"])
-                if orientation == "H":
-                    r = random.randint(0, 9)
-                    c = random.randint(0, 10 - size)
-                    coords = {(r, c + i) for i in range(size)}
-                else:
-                    r = random.randint(0, 10 - size)
-                    c = random.randint(0, 9)
-                    coords = {(r + i, c) for i in range(size)}
+    def add_ship(self, name: str, letter: str, size: int, coords: List[Tuple[int, int]]) -> bool:
+        """Adds a placed ship to the player's defense board."""
+        for r, c in coords:
+            self.defense_grid[r][c] = letter
+        self.ships.append({
+            "name": name,
+            "letter": letter,
+            "size": size,
+            "coords": set(coords),
+            "hits": set()
+        })
+        return True
 
-                # Check overlap against existing ships
-                if not any(coords & s["coords"] for s in self.ships):
-                    for cr, cc in coords:
-                        self.defense_grid[cr][cc] = "S"
-                    self.ships.append({
-                        "name": name,
-                        "coords": coords,
-                        "hits": set()
-                    })
-                    placed = True
-
-    def process_incoming_shot(self, r: int, c: int) -> Tuple[str, Optional[str]]:
+    def process_incoming_shot(self, r: int, c: int) -> Tuple[str, Optional[str], Optional[str]]:
         """
         Processes an incoming shot from the opponent at (r, c).
-        Returns (result, sunk_ship_name), where result is 'already_targeted', 'hit', or 'miss'.
+        Returns (result, sunk_ship_name, ship_letter).
+        Result is one of: 'already_targeted', 'hit', or 'miss'.
         """
         cell = self.defense_grid[r][c]
         if cell in ("X", "M"):
-            return "already_targeted", None
+            return "already_targeted", None, None
 
-        if cell == "S":
+        if cell in ("A", "B", "C", "S", "D"):
+            hit_letter = cell
             self.defense_grid[r][c] = "X"
-            sunk_ship = None
+            sunk_name = None
             for ship in self.ships:
                 if (r, c) in ship["coords"]:
                     ship["hits"].add((r, c))
                     if ship["hits"] == ship["coords"]:
-                        sunk_ship = ship["name"]
+                        sunk_name = ship["name"]
                     break
-            return "hit", sunk_ship
+            return "hit", sunk_name, hit_letter
         else:
             self.defense_grid[r][c] = "M"
-            return "miss", None
+            return "miss", None, None
 
     def all_ships_sunk(self) -> bool:
-        """Returns True if every cell of every ship has been hit."""
-        return all(ship["hits"] == ship["coords"] for ship in self.ships)
+        """Returns True if every cell of all 5 placed ships has been hit."""
+        return len(self.ships) == 5 and all(ship["hits"] == ship["coords"] for ship in self.ships)
 
 
 class MessageFramer:
@@ -161,7 +160,7 @@ class MessageFramer:
 
 def extract_coordinates(payload: dict) -> Optional[Tuple[int, int]]:
     """
-    Flexibly parses coordinates from various protocol payload schemas:
+    Flexibly parses target shot coordinates from various payload formats:
     - {'column': 'A', 'row': 1} or {'column': 'A', 'row': '1'}
     - {'row': 0, 'col': 2}
     - {'coordinate': 'A1'}
@@ -170,7 +169,6 @@ def extract_coordinates(payload: dict) -> Optional[Tuple[int, int]]:
     if not isinstance(payload, dict):
         return None
 
-    # Check coordinate string (e.g. 'A1', 'J10')
     if "coordinate" in payload and isinstance(payload["coordinate"], str):
         match = re.match(r"^([A-J])\s*([0-9]|10)$", payload["coordinate"].strip().upper())
         if match:
@@ -179,7 +177,6 @@ def extract_coordinates(payload: dict) -> Optional[Tuple[int, int]]:
             if 1 <= row_num <= 10:
                 return (row_num - 1, ord(col_letter) - ord("A"))
 
-    # Check column + row (e.g. column: "A", row: 1 or "1")
     if "column" in payload and "row" in payload:
         col_val = str(payload["column"]).strip().upper()
         try:
@@ -189,14 +186,11 @@ def extract_coordinates(payload: dict) -> Optional[Tuple[int, int]]:
 
         if len(col_val) == 1 and "A" <= col_val <= "J":
             col_idx = ord(col_val) - ord("A")
-            # Row could be 1-indexed (1..10) or 0-indexed (0..9)
             if 1 <= row_val <= 10:
-                row_idx = row_val - 1
-                return (row_idx, col_idx)
+                return (row_val - 1, col_idx)
             elif 0 <= row_val <= 9:
                 return (row_val, col_idx)
 
-    # Check row + col integers
     if "row" in payload and "col" in payload:
         try:
             r = int(payload["row"])
@@ -214,7 +208,7 @@ def extract_coordinates(payload: dict) -> Optional[Tuple[int, int]]:
 class BattleshipServer:
     """
     Multi-threaded Battleship server managing TCP connections, synchronization,
-    FSM states, turn validation, and game loop execution.
+    FSM states, player ship placement validation, turn control, and game execution.
     """
     def __init__(self, port: int):
         self.port = port
@@ -228,6 +222,7 @@ class BattleshipServer:
         self.state = ServerState.INIT
         self.clients: Dict[str, dict] = {}  # {player_id: {"sock": socket, "addr": addr, "role": role}}
         self.boards: Dict[str, PlayerBoard] = {}  # {player_id: PlayerBoard}
+        self.placed_players: Set[str] = set()  # Set of player_ids that have submitted valid placements
         self.active_turn: Optional[str] = None
         self.player_order: List[str] = []
 
@@ -243,6 +238,9 @@ class BattleshipServer:
             sys.exit(1)
 
         self.server_socket.listen(5)
+        # Set a short timeout on the listening socket so accept() periodically yields
+        # control, allowing Python to catch KeyboardInterrupt / signals immediately on Windows & Linux
+        self.server_socket.settimeout(0.5)
         self.running = True
         self.state = ServerState.WAITING_FOR_PLAYERS
 
@@ -255,10 +253,14 @@ class BattleshipServer:
             while self.running:
                 try:
                     conn, addr = self.server_socket.accept()
+                except socket.timeout:
+                    continue
                 except OSError:
                     break
 
-                # Spawn worker thread for each connected client
+                # Ensure accepted client socket is blocking for worker thread communication
+                conn.settimeout(None)
+
                 worker = threading.Thread(
                     target=self._client_handler,
                     args=(conn, addr),
@@ -267,15 +269,21 @@ class BattleshipServer:
                 worker.start()
 
         except KeyboardInterrupt:
-            print("\n[*] Server shutdown initiated by operator.")
+            print("\n[*] Server shutdown initiated by operator (Ctrl+C).")
         finally:
             self.stop()
 
     def stop(self):
         """Performs teardown of all client sockets and the listening socket."""
+        if not self.running and self.server_socket is None:
+            return
         self.running = False
         with self.state_lock:
             for pid, client_info in list(self.clients.items()):
+                try:
+                    client_info["sock"].shutdown(socket.SHUT_RDWR)
+                except Exception:
+                    pass
                 try:
                     client_info["sock"].close()
                 except Exception:
@@ -347,6 +355,11 @@ class BattleshipServer:
         if msg_type == "CONNECT":
             return self._handle_connect(conn, addr, client_player_id)
 
+        elif msg_type == "PLACE_SHIPS":
+            player_id = current_player_id or client_player_id
+            self._handle_place_ships(conn, player_id, msg.get("payload", {}))
+            return current_player_id
+
         elif msg_type == "MOVE":
             player_id = current_player_id or client_player_id
             self._handle_move(conn, player_id, msg.get("payload", {}))
@@ -358,7 +371,6 @@ class BattleshipServer:
             return current_player_id
 
         else:
-            # Unknown message type
             self._send_json(conn, "ERROR", client_player_id, {
                 "error_code": 400,
                 "error_message": f"Unsupported msg_type: '{msg_type}'"
@@ -366,13 +378,11 @@ class BattleshipServer:
             return current_player_id
 
     def _handle_connect(self, conn: socket.socket, addr: Tuple[str, int], requested_id: str) -> str:
-        """Handles client registration and game start triggers."""
-        start_game = False
+        """Handles client registration and match initialization."""
         to_notify_lobby = None
         game_start_payloads = []
 
         with self.state_lock:
-            # Assign player role (Player_1 or Player_2)
             if len(self.clients) == 0:
                 assigned_id = "Player_1"
                 self.clients[assigned_id] = {"sock": conn, "addr": addr, "role": assigned_id}
@@ -385,45 +395,20 @@ class BattleshipServer:
                 assigned_id = "Player_2"
                 self.clients[assigned_id] = {"sock": conn, "addr": addr, "role": assigned_id}
                 self.player_order.append(assigned_id)
-                self.state = ServerState.GAME_START
-                print(f"[Registration] Registered {assigned_id} from {addr}. Starting match!")
+                self.state = ServerState.SHIP_PLACEMENT
+                print(f"[Registration] Registered {assigned_id} from {addr}. Initiating ship placement phase!")
 
-                # Initialize game boards
                 p1_id = self.player_order[0]
                 p2_id = self.player_order[1]
-                self.boards[p1_id] = PlayerBoard(p1_id)
-                self.boards[p2_id] = PlayerBoard(p2_id)
-
-                # Turn mechanics: Initial turn decided via coin flip
-                self.active_turn = random.choice([p1_id, p2_id])
-                print(f"[Coin Flip] First turn awarded to: {self.active_turn}")
-
-                # Prepare GAME_START and initial STATE_UPDATE payloads
-                start_game = True
                 p1_sock = self.clients[p1_id]["sock"]
                 p2_sock = self.clients[p2_id]["sock"]
 
+                # Send GAME_START with instruction to place ships
                 game_start_payloads = [
-                    (p1_sock, "GAME_START", p1_id, {"role": p1_id, "turn": self.active_turn}),
-                    (p2_sock, "GAME_START", p2_id, {"role": p2_id, "turn": self.active_turn}),
-                    (p1_sock, "STATE_UPDATE", p1_id, {
-                        "move result": "Game started! Fleet positioned.",
-                        "offense board": format_board(self.boards[p1_id].offense_grid),
-                        "defense board": format_board(self.boards[p1_id].defense_grid),
-                        "next_turn": self.active_turn,
-                        "is_your_turn": (self.active_turn == p1_id)
-                    }),
-                    (p2_sock, "STATE_UPDATE", p2_id, {
-                        "move result": "Game started! Fleet positioned.",
-                        "offense board": format_board(self.boards[p2_id].offense_grid),
-                        "defense board": format_board(self.boards[p2_id].defense_grid),
-                        "next_turn": self.active_turn,
-                        "is_your_turn": (self.active_turn == p2_id)
-                    })
+                    (p1_sock, "GAME_START", p1_id, {"role": p1_id, "status": "place_ships"}),
+                    (p2_sock, "GAME_START", p2_id, {"role": p2_id, "status": "place_ships"})
                 ]
-                self.state = ServerState.PLAYER_TURN
             else:
-                # Lobby full (game only supports 2 players)
                 assigned_id = f"Observer_{len(self.clients) + 1}"
                 print(f"[Lobby Full] Connection from {addr} rejected: 2-player capacity reached.")
                 self._send_json(conn, "ERROR", assigned_id, {
@@ -437,11 +422,144 @@ class BattleshipServer:
         if to_notify_lobby:
             self._send_json(to_notify_lobby[0], "LOBBY_WAIT", to_notify_lobby[1])
 
-        if start_game:
-            for s, mtype, pid, payload in game_start_payloads:
-                self._send_json(s, mtype, pid, payload)
+        for s, mtype, pid, payload in game_start_payloads:
+            self._send_json(s, mtype, pid, payload)
 
         return assigned_id
+
+    def _handle_place_ships(self, conn: socket.socket, player_id: str, payload: dict):
+        """Validates and registers player ship placement."""
+        error_msg = None
+        start_battle = False
+        battle_start_broadcasts = []
+        waiting_notification = None
+
+        with self.state_lock:
+            if self.state != ServerState.SHIP_PLACEMENT and self.state != ServerState.GAME_START:
+                error_msg = "Game is not in the ship placement phase."
+            elif player_id in self.placed_players:
+                error_msg = "Fleet has already been placed for this match."
+            else:
+                ships_data = payload.get("ships", [])
+                if not isinstance(ships_data, list) or len(ships_data) != 5:
+                    error_msg = "Invalid placement: Must provide exactly 5 ships."
+                else:
+                    # Validate all 5 required ships and letters
+                    board = PlayerBoard(player_id)
+                    occupied_cells: Set[Tuple[int, int]] = set()
+
+                    expected_ships = {s["letter"]: s for s in FLEET_SPEC}
+                    placed_letters = set()
+
+                    for ship in ships_data:
+                        letter = str(ship.get("letter", "")).upper()
+                        name = ship.get("name", "")
+                        if letter not in expected_ships:
+                            error_msg = f"Invalid ship letter '{letter}'. Must be A, B, C, S, or D."
+                            break
+                        if letter in placed_letters:
+                            error_msg = f"Duplicate placement for ship '{letter}'."
+                            break
+
+                        spec = expected_ships[letter]
+                        size = spec["size"]
+                        placed_letters.add(letter)
+
+                        # Extract coordinates list
+                        raw_coords = ship.get("coords", [])
+                        if len(raw_coords) != size:
+                            error_msg = f"Ship '{letter}' ({spec['name']}) must occupy exactly {size} slots."
+                            break
+
+                        coords: List[Tuple[int, int]] = []
+                        for item in raw_coords:
+                            if isinstance(item, (list, tuple)) and len(item) == 2:
+                                r, c = int(item[0]), int(item[1])
+                            elif isinstance(item, dict) and "row" in item and "col" in item:
+                                r, c = int(item["row"]), int(item["col"])
+                            else:
+                                error_msg = f"Malformed coordinate item: {item}"
+                                break
+
+                            if not (0 <= r <= 9 and 0 <= c <= 9):
+                                error_msg = f"Coordinates for '{letter}' out of board bounds [0..9]."
+                                break
+                            if (r, c) in occupied_cells:
+                                error_msg = f"Overlap detected for '{letter}' at ({r},{c})."
+                                break
+
+                            coords.append((r, c))
+                            occupied_cells.add((r, c))
+
+                        if error_msg:
+                            break
+
+                        # Check linearity and contiguity
+                        rows = [r for r, c in coords]
+                        cols = [c for r, c in coords]
+                        is_horizontal = len(set(rows)) == 1 and sorted(cols) == list(range(min(cols), min(cols) + size))
+                        is_vertical = len(set(cols)) == 1 and sorted(rows) == list(range(min(rows), min(rows) + size))
+
+                        if not (is_horizontal or is_vertical):
+                            error_msg = f"Ship '{letter}' must be placed in a contiguous straight line."
+                            break
+
+                        board.add_ship(spec["name"], letter, size, coords)
+
+                    if not error_msg:
+                        self.boards[player_id] = board
+                        self.placed_players.add(player_id)
+                        print(f"[Fleet Deployed] {player_id} placed all 5 ships ({len(occupied_cells)} slots).")
+
+                        # If both players have placed ships, proceed to battle!
+                        if len(self.placed_players) == 2:
+                            start_battle = True
+                            p1_id = self.player_order[0]
+                            p2_id = self.player_order[1]
+
+                            # Turn Mechanics: Initial turn decided via coin flip
+                            self.active_turn = random.choice([p1_id, p2_id])
+                            self.state = ServerState.PLAYER_TURN
+                            print(f"[Coin Flip] Initial turn awarded to: {self.active_turn}")
+
+                            p1_sock = self.clients[p1_id]["sock"]
+                            p2_sock = self.clients[p2_id]["sock"]
+
+                            battle_start_broadcasts = [
+                                (p1_sock, "STATE_UPDATE", p1_id, {
+                                    "move result": "All fleets deployed! Battle commences.",
+                                    "offense board": format_board(self.boards[p1_id].offense_grid),
+                                    "defense board": format_board(self.boards[p1_id].defense_grid),
+                                    "next_turn": self.active_turn,
+                                    "is_your_turn": (self.active_turn == p1_id)
+                                }),
+                                (p2_sock, "STATE_UPDATE", p2_id, {
+                                    "move result": "All fleets deployed! Battle commences.",
+                                    "offense board": format_board(self.boards[p2_id].offense_grid),
+                                    "defense board": format_board(self.boards[p2_id].defense_grid),
+                                    "next_turn": self.active_turn,
+                                    "is_your_turn": (self.active_turn == p2_id)
+                                })
+                            ]
+                        else:
+                            waiting_notification = (conn, player_id)
+
+        # Transmit outside state lock
+        if error_msg:
+            self._send_json(conn, "ERROR", player_id, {
+                "error_code": 400,
+                "error_message": error_msg
+            })
+            return
+
+        if waiting_notification:
+            self._send_json(waiting_notification[0], "LOBBY_WAIT", waiting_notification[1], {
+                "message": "Fleet registered! Waiting for opponent to place ships."
+            })
+
+        if start_battle:
+            for s, mtype, pid, pld in battle_start_broadcasts:
+                self._send_json(s, mtype, pid, pld)
 
     def _handle_move(self, conn: socket.socket, player_id: str, payload: dict):
         """Processes player moves, evaluates hits/misses, updates FSM state and broadcasts."""
@@ -449,10 +567,8 @@ class BattleshipServer:
         error_msg = None
 
         with self.state_lock:
-            # 1. State Validation
             if self.state != ServerState.PLAYER_TURN:
-                error_msg = "Game is not in active play."
-            # 2. Turn Validation
+                error_msg = "Game is not in active play (ships may still be deploying)."
             elif player_id != self.active_turn:
                 error_msg = f"Invalid action: It is not your turn (Current turn: {self.active_turn})."
             else:
@@ -466,31 +582,28 @@ class BattleshipServer:
                     attacker_board = self.boards[attacker_id]
                     defender_board = self.boards[defender_id]
 
-                    # 3. Check if cell was already targeted
                     if attacker_board.offense_grid[r][c] in ("X", "M"):
                         error_msg = "Invalid move: Cell already guessed."
                     else:
-                        # 4. Valid target shot: process shot
                         col_letter = chr(ord("A") + c)
                         row_label = r + 1
                         coord_str = f"{col_letter}{row_label}"
 
-                        shot_result, sunk_name = defender_board.process_incoming_shot(r, c)
+                        shot_result, sunk_name, hit_letter = defender_board.process_incoming_shot(r, c)
 
                         if shot_result == "hit":
                             attacker_board.offense_grid[r][c] = "X"
                             if sunk_name:
-                                move_result_str = f"HIT! You sank the enemy's {sunk_name} at {coord_str}!"
-                                opp_result_str = f"ENEMY HIT! Your {sunk_name} was SUNK at {coord_str}!"
+                                move_result_str = f"HIT! You sank the enemy's {sunk_name} ({hit_letter}) at {coord_str}!"
+                                opp_result_str = f"ENEMY HIT! Your {sunk_name} ({hit_letter}) was SUNK at {coord_str}!"
                             else:
-                                move_result_str = f"HIT at {coord_str}!"
-                                opp_result_str = f"ENEMY HIT at {coord_str}!"
+                                move_result_str = f"HIT on enemy ship ({hit_letter}) at {coord_str}!"
+                                opp_result_str = f"ENEMY HIT on your fleet ({hit_letter}) at {coord_str}!"
                         else:
                             attacker_board.offense_grid[r][c] = "M"
                             move_result_str = f"MISS at {coord_str}."
                             opp_result_str = f"Enemy shot at {coord_str} was a MISS."
 
-                        # 5. Check victory condition
                         if defender_board.all_ships_sunk():
                             self.state = ServerState.GAME_OVER
                             winner = attacker_id
@@ -516,7 +629,6 @@ class BattleshipServer:
                                 (defender_sock, "GAME_OVER", defender_id, {"winner": winner})
                             ])
                         else:
-                            # Toggle active turn
                             self.active_turn = defender_id
                             print(f"[Turn Shift] {attacker_id} fired at {coord_str} ({shot_result.upper()}). Next: {self.active_turn}")
 
@@ -540,7 +652,6 @@ class BattleshipServer:
                                 })
                             ])
 
-        # Socket transmissions outside lock
         if error_msg:
             self._send_json(conn, "ERROR", player_id, {
                 "error_code": 400,
@@ -556,7 +667,6 @@ class BattleshipServer:
         remaining_client = None
 
         with self.state_lock:
-            # Close socket
             try:
                 conn.close()
             except Exception:
@@ -566,18 +676,17 @@ class BattleshipServer:
                 del self.clients[player_id]
                 print(f"[*] Removed {player_id} from active client registry.")
 
-            # If game was in progress and someone disconnected, remaining player wins
-            if self.state in (ServerState.PLAYER_TURN, ServerState.GAME_START, ServerState.EVALUATE_MOVE):
+            if self.state in (ServerState.PLAYER_TURN, ServerState.GAME_START, ServerState.SHIP_PLACEMENT, ServerState.EVALUATE_MOVE):
                 self.state = ServerState.GAME_OVER
                 if self.clients:
                     rem_id = next(iter(self.clients.keys()))
                     remaining_client = (self.clients[rem_id]["sock"], rem_id)
                 print(f"[Forfeit] Player {player_id} disconnected during game.")
 
-            # Reset game if both or active players gone
             if len(self.clients) == 0 or self.state == ServerState.GAME_OVER:
                 self.state = ServerState.CLEANUP
                 self.boards.clear()
+                self.placed_players.clear()
                 self.player_order.clear()
                 self.active_turn = None
                 self.state = ServerState.WAITING_FOR_PLAYERS
@@ -620,6 +729,18 @@ def main():
         sys.exit(1)
 
     server = BattleshipServer(port=args.port)
+
+    def signal_handler(sig, frame):
+        print("\n[*] Server shutdown initiated by operator (Ctrl+C).")
+        server.stop()
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, signal_handler)
+    if hasattr(signal, "SIGBREAK"):  # Windows Ctrl+Break support
+        signal.signal(signal.SIGBREAK, signal_handler)
+    if hasattr(signal, "SIGTERM"):
+        signal.signal(signal.SIGTERM, signal_handler)
+
     server.start()
 
 

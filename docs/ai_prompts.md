@@ -27,3 +27,18 @@ Key Constraints:
 CLI Argument Parsing: The server.py file should accept command-line arguments for the port number to listen on. Use the argparse library to handle these arguments.
 -h: displays help instructions
 -p Port number to listen on(required; binds to 0.0.0.0)
+
+AI Prompt for adding ship placement selection and adjusting to each ship corresponding to a letter:
+Initial generation looks good, one thing that needs adjustment right off the bat is that I want the players to position the ships themselves. I'd also like the different ships to be designated by different letters
+A: Aircraft Carrier(5 slots)
+B: Battleship(4 slots)
+C: Cruiser(3 slots)
+S: Submarine(3 slots)
+D: Destroyer(2 slots)
+
+Have them place the ships in order, and validate that the placement is valid (i.e., ships do not overlap and are within the bounds of the board). The player should be prompted to enter the starting coordinate and orientation (horizontal or vertical) for each ship. If the placement is invalid, prompt the player to re-enter the coordinates until a valid placement is made.
+
+Ai Prompt Adjustments:
+Lets give players the option to have the ships be randomly placed or place it themselves.
+
+I'd also like the move result to be displayed below the last board update so it is easier to understand what happened. I'd also like to add colors to the board, specifically hits I want to be Red
